@@ -40,6 +40,15 @@ USER_ID = sys.argv[1] if len(sys.argv) > 1 else None
 #ADDRESS = "A1:B2:C3:D4:E5:F6"
 ADDRESS = sys.argv[2] if len(sys.argv) > 2 else None
 
+# Optional one-shot command to fire once the session is live (first heartbeat
+# decoded). One of:
+#   ac_on, ac_off, dc_on, dc_off,
+#   pbox_self_on, pbox_self_off    (PrStateSet set_self: per-DPU join/leave parallel mode)
+#   pbox_para_on, pbox_para_off    (PrStateSet set_para: parallel-box/hub link enable/disable)
+#   pbox_master_on, pbox_master_off (mirror app master switch: set_self=0, set_para=x)
+# Example: python connect.py <user_id> <address> ac_off
+CMD = sys.argv[3] if len(sys.argv) > 3 else None
+
 _login_key = b''
 with open('login_key.bin', 'rb') as file:
     _login_key = file.read()
@@ -320,6 +329,25 @@ class Connection:
         self._disconnected = asyncio.Event()
         self._client = None
         self._enc_packet_buffer = b''
+        self._startup_cmd_fired = False
+        # Latest values parsed from AppShowHeartbeatReport, for external control.
+        self._last_soc = None
+        self._last_show_flag = None
+        self._last_access_5p8_out_type = None
+        # Optional async callback invoked after each heartbeat: cb(connection).
+        self._heartbeat_cb = None
+
+    @property
+    def sn(self):
+        return self._dev_sn
+
+    @property
+    def last_soc(self):
+        return self._last_soc
+
+    def set_heartbeat_callback(self, cb):
+        '''Register an async callback cb(connection) fired on each heartbeat.'''
+        self._heartbeat_cb = cb
 
     async def shutdown(self):
         self._retry_on_disconnect = False
@@ -692,6 +720,18 @@ class Connection:
                     processed = True
                     send_reply = True
                     print("YJ751 AppShowHeartbeatReport:", str(p))
+                    # Capture fields used by the external controller.
+                    if p.HasField('soc'):
+                        self._last_soc = p.soc
+                    if p.HasField('show_flag'):
+                        self._last_show_flag = p.show_flag
+                    if p.HasField('access_5p8_out_type'):
+                        self._last_access_5p8_out_type = p.access_5p8_out_type
+                    # Session is proven live (we just decrypted a heartbeat) -
+                    # fire the optional one-shot CLI command exactly once.
+                    await self.runStartupCommand()
+                    if self._heartbeat_cb is not None:
+                        await self._heartbeat_cb(self)
                 elif packet.cmdId == 0x02:  # Port Current, Voltage, Frequency
                     p = yj751_sys_pb2.BackendRecordHeartbeatReport()
                     p.ParseFromString(packet.payload)
@@ -809,6 +849,117 @@ class Connection:
         packet = Packet(0x21, 0x0B, 0x0C, 0x21, payload, 0x01, 0x01, 0x13)
 
         await self.sendPacket(packet)
+
+    # ------------------------------------------------------------------
+    # DPU (YJ751 / Delta Pro Ultra) command senders
+    #
+    # All DPU control commands share the same framing as the ha-ef-ble
+    # integration's _send_command_packet:
+    #     Packet(0x21, dst, cmd_set, cmd_id, payload, 0x01, 0x01, 0x13)
+    # with dst defaulting to 0x02 (the DPU main MCU). See:
+    #   /tmp/ha-ef-ble/.../eflib/devices/dpu.py
+    # ------------------------------------------------------------------
+
+    async def sendDpuCommand(self, cmd_set: int, cmd_id: int, message, dst: int = 0x02):
+        '''Serialize a yj751_sys_pb2 message and send it as a DPU command packet.'''
+        payload = message.SerializeToString()
+        print("%s: INFO: sendDpuCommand: dst=0x%02X cmd_set=0x%02X cmd_id=0x%02X payload=%s" % (
+            self._address, dst, cmd_set, cmd_id, bytearray(payload).hex(),
+        ))
+        packet = Packet(0x21, dst, cmd_set, cmd_id, payload, 0x01, 0x01, 0x13)
+        await self.sendPacket(packet)
+
+    async def sendRawDpuCommand(self, cmd_set: int, cmd_id: int, payload: bytes, dst: int = 0x02):
+        '''Send a raw (already-serialized) DPU command payload.
+
+        Use this to replay a command captured from the app when we do not yet
+        have a matching protobuf message class.
+        '''
+        print("%s: INFO: sendRawDpuCommand: dst=0x%02X cmd_set=0x%02X cmd_id=0x%02X payload=%s" % (
+            self._address, dst, cmd_set, cmd_id, bytearray(payload).hex(),
+        ))
+        packet = Packet(0x21, dst, cmd_set, cmd_id, payload, 0x01, 0x01, 0x13)
+        await self.sendPacket(packet)
+
+    async def setAcOutput(self, enable: bool):
+        '''Enable/disable AC output. Known-good command (verify via show_flag bit 2).'''
+        print("%s: INFO: setAcOutput: %s" % (self._address, enable))
+        message = yj751_sys_pb2.ACDsgSet(enable=int(enable))
+        await self.sendDpuCommand(0x02, 0x48, message)
+
+    async def setDcOutput(self, enable: bool):
+        '''Enable/disable DC output. Known-good command (verify via show_flag bit 1).'''
+        print("%s: INFO: setDcOutput: %s" % (self._address, enable))
+        message = yj751_sys_pb2.DCSwitchSet(enable=int(enable))
+        await self.sendDpuCommand(0x02, 0x44, message)
+
+    async def setParallelBox(self, set_self=None, set_para=None):
+        '''Control parallel mode / parallel-box ("50A hub") link via PrStateSet.
+
+        Recovered from the EcoFlow app (jw/a.D -> R(2, 106, msg)):
+            message = PrStateSet, cmd_set = 0x02, cmd_id = 0x6A
+        The app only serializes a field when it is set (-1 == "leave unset"), so
+        pass None to omit a field.
+
+          set_self : this unit joins(1)/leaves(0) parallel mode.
+                     Driven by the per-DPU card toggle in the app's space view.
+          set_para : parallel-box (hub) link enable(1)/disable(0).
+                     Driven by the app's "parallel system" master switch
+                     (which also sends set_self=0).
+
+        Verify the effect via access_5p8_out_type in AppShowHeartbeatReport
+        (OUT_PARALLEL_BOX=1 / OUT_IDLE=0) and show_flag bit 7.
+        '''
+        message = yj751_sys_pb2.PrStateSet()
+        if set_self is not None:
+            message.set_self = int(set_self)
+        if set_para is not None:
+            message.set_para = int(set_para)
+        print("%s: INFO: setParallelBox: set_self=%s set_para=%s" % (
+            self._address, set_self, set_para,
+        ))
+        await self.sendDpuCommand(0x02, 0x6A, message)
+
+    async def runStartupCommand(self):
+        '''Fire the optional one-shot command from the CLI (global CMD), once.'''
+        if self._startup_cmd_fired or not CMD:
+            return
+        self._startup_cmd_fired = True
+
+        cmd = CMD.strip().lower()
+        print("%s: INFO: runStartupCommand: %r" % (self._address, cmd))
+        try:
+            if cmd == "ac_on":
+                await self.setAcOutput(True)
+            elif cmd == "ac_off":
+                await self.setAcOutput(False)
+            elif cmd == "dc_on":
+                await self.setDcOutput(True)
+            elif cmd == "dc_off":
+                await self.setDcOutput(False)
+            # Parallel-box / parallel-mode (PrStateSet, 0x02/0x6A). Two fields,
+            # tested independently to see which flips access_5p8_out_type:
+            #   *_self_* -> per-DPU join/leave parallel mode (set_self)
+            #   *_para_* -> parallel-box/hub link enable/disable (set_para)
+            #   pbox_master_* -> mirror app master switch (set_self=0, set_para=x)
+            elif cmd == "pbox_self_on":
+                await self.setParallelBox(set_self=1)
+            elif cmd == "pbox_self_off":
+                await self.setParallelBox(set_self=0)
+            elif cmd == "pbox_para_on":
+                await self.setParallelBox(set_para=1)
+            elif cmd == "pbox_para_off":
+                await self.setParallelBox(set_para=0)
+            elif cmd == "pbox_master_on":
+                await self.setParallelBox(set_self=0, set_para=1)
+            elif cmd == "pbox_master_off":
+                await self.setParallelBox(set_self=0, set_para=0)
+            else:
+                print("%s: WARN: unknown command %r (expected ac_on/ac_off/dc_on/dc_off/"
+                      "pbox_self_on/pbox_self_off/pbox_para_on/pbox_para_off/"
+                      "pbox_master_on/pbox_master_off)" % (self._address, cmd))
+        except NotImplementedError as e:
+            print("%s: WARN: %s" % (self._address, e))
 
     async def sendUtcTime(self):
         print("%s: INFO: sendUtcTime" % (self._address,))
