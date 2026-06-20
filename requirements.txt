@@ -4,3 +4,4 @@ ecdsa
 fastcrc
 PyCryptodome
 protobuf==5.28.0
+aiohttp

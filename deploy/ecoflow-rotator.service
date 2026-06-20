@@ -1,0 +1,45 @@
+[Unit]
+Description=EcoFlow two-DPU parallel charge-rotation controller + portal
+Documentation=https://github.com/PatrickLaflamme/ef-ble-reverse
+Wants=network-online.target
+After=network-online.target bluetooth.target
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+User=ecoflow
+Group=ecoflow
+EnvironmentFile=/etc/ecoflow/rotator.env
+WorkingDirectory=/opt/ecoflow-rotator
+ExecStart=/opt/ecoflow-rotator/.venv/bin/python /opt/ecoflow-rotator/controller.py
+
+# Resilience: bleak/bleak-retry reconnect internally; if the process dies,
+# systemd restarts it.
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Hardening (mirrors ecoflow-keeper, adjusted for BLE + local HTTP).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+# NOTE: BLE needs AF_UNIX (DBus -> BlueZ) and AF_BLUETOOTH; AF_INET(6) is for
+# the local HTTP portal. This differs from the keeper (which only needs INET).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_BLUETOOTH
+# NOTE: MemoryDenyWriteExecute is intentionally OMITTED here — it can break
+# Python C-extension loading used by aiohttp/bleak. Re-add only if verified.
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ecoflow-rotator
+
+[Install]
+WantedBy=multi-user.target
