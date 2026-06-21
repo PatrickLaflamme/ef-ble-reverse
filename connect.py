@@ -353,7 +353,7 @@ class Connection:
         self._retry_on_disconnect = False
         if self._client != None:
             await self._client.disconnect()
-        self._done.set()
+        self._disconnected.set()
 
     async def waitDisconnect(self):
         await self._disconnected.wait()

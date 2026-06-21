@@ -24,10 +24,12 @@ CLI fallback:
 import asyncio
 import collections
 import os
+import signal
 import sys
 import time
 
 from bleak import BleakScanner
+from bleak_retry_connector import close_stale_connections_by_address
 
 import connect
 from connect import located_devices, discoveryCallback
@@ -288,6 +290,17 @@ async def main(user_id, addresses, http_host="127.0.0.1", http_port=8787):
     connect.USER_ID = user_id
     connect.CMD = None  # we drive commands ourselves, not the one-shot CLI hook
 
+    # On an unclean restart (SIGKILL / crash) BlueZ can still hold a connection
+    # to a target device. A connected peripheral does not advertise, so the scan
+    # below would miss it and we'd fail to start. Proactively drop any stale link
+    # so the device advertises again and we get a clean session.
+    for addr in addresses:
+        try:
+            await close_stale_connections_by_address(addr.upper())
+            print("INFO: cleared any stale BT connection to %s" % addr.upper())
+        except Exception as e:
+            print("WARN: close_stale_connections(%s): %s" % (addr.upper(), e))
+
     scanner = BleakScanner(discoveryCallback)
     print("INFO: scanning for %d device(s)..." % len(addresses))
     async with scanner:
@@ -312,8 +325,33 @@ async def main(user_id, addresses, http_host="127.0.0.1", http_port=8787):
         await dev.connect()
         ctrl.add(key, dev._conn)
 
-    # Run until both connections drop (Connection auto-reconnects on its own).
-    await asyncio.gather(*(dev.waitDisconnect() for _, dev in devices))
+    # Graceful shutdown: on SIGTERM/SIGINT (systemd stop/restart) disconnect the
+    # BLE links cleanly so the next start finds advertising devices.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
+
+    # Run until a stop signal or all connections drop for good.
+    waiters = [asyncio.create_task(dev.waitDisconnect()) for _, dev in devices]
+    stop_task = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait(set(waiters) | {stop_task},
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        print("INFO: shutting down — disconnecting BLE links cleanly")
+        for _, dev in devices:
+            conn = getattr(dev, "_conn", None)
+            if conn is not None:
+                try:
+                    await conn.shutdown()
+                except Exception as e:
+                    print("WARN: shutdown %s: %s" % (dev._address, e))
+        for t in (*waiters, stop_task):
+            t.cancel()
 
 
 if __name__ == "__main__":
