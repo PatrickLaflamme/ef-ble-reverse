@@ -96,6 +96,58 @@ class MetricsTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_loss_estimate_from_soc_and_capacity(self):
+        m, path = fresh()
+        try:
+            cap = 6000  # Wh
+            # 1h: in 1000Wh, out 0; SoC 50 -> 60 => stored 0.10*6000 = 600Wh.
+            # loss = 1000 - 0 - 600 = 400Wh.
+            m.record("A", T0, True, 0, 0, 0, 0, soc=50, cap_wh=cap)
+            m.record("A", T0 + 3600, True, 1000, 0, 0, 0, soc=60, cap_wh=cap)
+            u = m.summary(T0)["all_time"]["per_unit"]["A"]
+            self.assertAlmostEqual(u["loss_wh"], 400, delta=2)
+
+        finally:
+            m.close(); os.unlink(path)
+
+    def test_loss_zero_without_capacity(self):
+        m, path = fresh()
+        try:
+            m.record("A", T0, True, 0, 0, 0, 0, soc=50, cap_wh=None)
+            m.record("A", T0 + 3600, True, 1000, 0, 0, 0, soc=60, cap_wh=None)
+            u = m.summary(T0)["all_time"]["per_unit"]["A"]
+            self.assertEqual(u["loss_wh"], 0)  # no capacity -> no loss estimate
+        finally:
+            m.close(); os.unlink(path)
+
+    def test_history_samples_recorded_and_windowed(self):
+        m, path = fresh()
+        try:
+            # samples are downsampled to >= SAMPLE_INTERVAL_S apart
+            for i in range(5):
+                m.record("A", T0 + i * metrics.SAMPLE_INTERVAL_S, True,
+                         100, 0, 50, 0, soc=50 + i, cap_wh=6000)
+            hist = m.history(hours=24, now_ts=T0 + 5 * metrics.SAMPLE_INTERVAL_S)
+            self.assertIn("A", hist)
+            self.assertEqual(len(hist["A"]), 5)
+            self.assertEqual(hist["A"][0]["soc"], 50)
+            # narrow window excludes older samples
+            recent = m.history(hours=0.02, now_ts=T0 + 5 * metrics.SAMPLE_INTERVAL_S)
+            self.assertLess(len(recent.get("A", [])), 5)
+        finally:
+            m.close(); os.unlink(path)
+
+    def test_samples_downsampled(self):
+        m, path = fresh()
+        try:
+            # two records closer than SAMPLE_INTERVAL_S -> only one sample row
+            m.record("A", T0, True, 100, 0, 0, 0, soc=50, cap_wh=6000)
+            m.record("A", T0 + 5, True, 100, 0, 0, 0, soc=50, cap_wh=6000)
+            hist = m.history(hours=24, now_ts=T0 + 5)
+            self.assertEqual(len(hist["A"]), 1)
+        finally:
+            m.close(); os.unlink(path)
+
     def test_today_vs_all_time_buckets(self):
         m, path = fresh()
         try:

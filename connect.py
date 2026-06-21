@@ -736,6 +736,7 @@ class Connection:
                         'watts_out': _pf('watts_out_sum'),
                         'solar': _pf('in_lv_mppt_pwr') + _pf('in_hv_mppt_pwr'),
                         'grid': _pf('in_ac_5p8_pwr') + _pf('in_ac_c20_pwr'),
+                        'bp_num': p.bp_num if p.HasField('bp_num') else None,
                     }
                     # Session is proven live (we just decrypted a heartbeat) -
                     # fire the optional one-shot CLI command exactly once.

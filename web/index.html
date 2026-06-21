@@ -48,6 +48,12 @@
   table.m thead th { color:var(--muted); font-weight:600; }
   table.m tfoot td { font-weight:700; border-top:2px solid #2d3a4d; border-bottom:0; }
   .solar { color:var(--charge); }
+  .chart { background:var(--card); border:1px solid #222c3a; border-radius:10px; padding:10px 12px; margin:10px 0; }
+  .chart .cap { font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .chart canvas { width:100%; display:block; }
+  .legend { font-size:12px; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:5px; }
+  .legend i { width:11px; height:3px; display:inline-block; border-radius:2px; }
   .policy { margin-top:22px; color:var(--muted); font-size:12px; line-height:1.7;
             border-top:1px solid #222c3a; padding-top:14px; }
   .err { color:var(--err); font-size:13px; margin-top:10px; min-height:18px; }
@@ -74,6 +80,12 @@
     <button class="segbtn" data-scope="all_time">All time</button>
   </div>
   <div id="metrics"></div>
+  <h2 class="mh">Last 24h</h2>
+  <div class="chart"><div class="cap">State of charge (%)</div>
+    <canvas id="socChart" height="160"></canvas></div>
+  <div class="chart"><div class="cap">Power (W) — solar, grid in, output</div>
+    <canvas id="pwrChart" height="160"></canvas></div>
+  <div class="legend" id="legend"></div>
   <div class="policy" id="policy"></div>
   <div class="ts" id="ts"></div>
 </main>
@@ -172,21 +184,24 @@ function renderMetrics(m) {
        <td>${kwh(u.grid_wh)}</td>
        <td>${kwh(u.in_wh)}</td>
        <td>${kwh(u.out_wh)}</td>
-       <td>${kwh(u.delta_wh)}</td></tr>`;
+       <td>${kwh(u.delta_wh)}</td>
+       <td>${kwh(u.loss_wh)}</td></tr>`;
   const body = units.map((k, i) =>
     row('Unit ' + String.fromCharCode(65 + i) + ' · ' + k, scope.per_unit[k])).join('');
   const t = scope.totals;
   document.getElementById('metrics').innerHTML = `
     <table class="m">
       <thead><tr><th>unit</th><th>charging</th><th>solar kWh</th>
-        <th>grid kWh</th><th>in kWh</th><th>out kWh</th><th>in&minus;out kWh</th></tr></thead>
-      <tbody>${body || '<tr><td colspan=7 class="meta">no data yet</td></tr>'}</tbody>
+        <th>grid kWh</th><th>in kWh</th><th>out kWh</th><th>in&minus;out</th>
+        <th>loss kWh</th></tr></thead>
+      <tbody>${body || '<tr><td colspan=8 class="meta">no data yet</td></tr>'}</tbody>
       <tfoot><tr><td>Total</td><td>${fmtHrs(t.charge_s)}</td>
         <td class="solar">${kwh(t.solar_wh)}</td><td>${kwh(t.grid_wh)}</td>
-        <td>${kwh(t.in_wh)}</td><td>${kwh(t.out_wh)}</td><td>${kwh(t.delta_wh)}</td></tr></tfoot>
+        <td>${kwh(t.in_wh)}</td><td>${kwh(t.out_wh)}</td><td>${kwh(t.delta_wh)}</td>
+        <td>${kwh(t.loss_wh)}</td></tr></tfoot>
     </table>
-    <div class="meta">in&minus;out kWh = energy stored in batteries + conversion/standby losses
-      (&approx; pure loss over a full charge/discharge cycle).</div>`;
+    <div class="meta">in&minus;out = stored in batteries + losses. <b>loss</b> = in&minus;out
+      &minus; battery &Delta;SoC&times;capacity (estimated true conversion/standby loss).</div>`;
 }
 
 async function refreshMetrics() {
@@ -203,6 +218,85 @@ document.querySelectorAll('.segbtn').forEach(b => {
     refreshMetrics();
   });
 });
+
+const COL = { A: '#388bfd', B: '#2ea043', solar: '#d29922', grid: '#58a6ff', out: '#f85149' };
+
+function drawChart(canvas, series, ymin, ymax) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 600, cssH = canvas.height;
+  canvas.width = cssW * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  const padL = 34, padR = 6, padT = 8, padB = 6;
+  const W = cssW - padL - padR, H = cssH - padT - padB;
+  let xmin = Infinity, xmax = -Infinity;
+  series.forEach(s => s.pts.forEach(p => {
+    if (p[1] == null) return;
+    if (p[0] < xmin) xmin = p[0]; if (p[0] > xmax) xmax = p[0];
+  }));
+  if (!isFinite(xmin) || xmax <= xmin) {
+    ctx.fillStyle = '#8b98a5'; ctx.font = '12px sans-serif';
+    ctx.fillText('collecting…', padL, padT + H / 2); return;
+  }
+  if (ymin == null || ymax == null) {
+    ymin = Infinity; ymax = -Infinity;
+    series.forEach(s => s.pts.forEach(p => {
+      if (p[1] == null) return;
+      if (p[1] < ymin) ymin = p[1]; if (p[1] > ymax) ymax = p[1];
+    }));
+    if (ymin === ymax) ymax = ymin + 1;
+  }
+  const X = t => padL + (t - xmin) / (xmax - xmin) * W;
+  const Y = v => padT + (1 - (v - ymin) / (ymax - ymin)) * H;
+  ctx.strokeStyle = '#222c3a'; ctx.fillStyle = '#8b98a5';
+  ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 2; i++) {
+    const v = ymin + (ymax - ymin) * i / 2, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + W, y); ctx.stroke();
+    ctx.fillText(Math.round(v), 2, y + 3);
+  }
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.6;
+    ctx.setLineDash(s.dash ? [3, 3] : []);
+    ctx.beginPath(); let started = false;
+    s.pts.forEach(p => {
+      if (p[1] == null) { started = false; return; }
+      const x = X(p[0]), y = Y(p[1]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+}
+
+function lineFor(arr, key) { return arr.map(s => [s.ts, s[key]]); }
+
+function renderHistory(hist) {
+  const units = Object.keys(hist);
+  const soc = units.map((u, i) => ({ pts: lineFor(hist[u], 'soc'), color: i === 0 ? COL.A : COL.B, dash: i > 0 }));
+  drawChart(document.getElementById('socChart'), soc, 0, 100);
+  const pwr = [];
+  units.forEach((u, i) => {
+    pwr.push({ pts: lineFor(hist[u], 'solar_w'), color: COL.solar, dash: i > 0 });
+    pwr.push({ pts: lineFor(hist[u], 'grid_w'), color: COL.grid, dash: i > 0 });
+    pwr.push({ pts: lineFor(hist[u], 'watts_out'), color: COL.out, dash: i > 0 });
+  });
+  drawChart(document.getElementById('pwrChart'), pwr, null, null);
+  const uleg = units.map((u, i) =>
+    `<span><i style="background:${i === 0 ? COL.A : COL.B}"></i>Unit ${String.fromCharCode(65 + i)}</span>`).join('');
+  document.getElementById('legend').innerHTML = uleg +
+    ` &nbsp;|&nbsp; <span><i style="background:${COL.solar}"></i>solar</span>` +
+    `<span><i style="background:${COL.grid}"></i>grid</span>` +
+    `<span><i style="background:${COL.out}"></i>output</span> (unit B dashed)`;
+}
+
+async function refreshHistory() {
+  try {
+    const r = await fetch('/api/history?hours=24');
+    renderHistory(await r.json());
+  } catch (e) { /* keep previous */ }
+}
 
 async function refresh() {
   try {
@@ -237,8 +331,11 @@ document.querySelectorAll('button[data-action]').forEach(b => {
 
 refresh();
 refreshMetrics();
+refreshHistory();
 setInterval(refresh, 3000);
 setInterval(refreshMetrics, 15000);
+setInterval(refreshHistory, 60000);
+window.addEventListener('resize', refreshHistory);
 </script>
 </body>
 </html>

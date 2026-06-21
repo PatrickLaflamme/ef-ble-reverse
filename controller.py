@@ -46,6 +46,9 @@ RATE_WINDOW_S = 1800      # only use SoC samples from this trailing window
 RATE_MIN_SPAN_S = 300     # need >= this much time span for a confident rate
 SOC_HIST_MAXLEN = 720
 
+# Per-battery-pack energy (Wh) for the loss estimate; DPU packs are ~6.14 kWh.
+PACK_WH = int(os.environ.get("ECOFLOW_PACK_WH", "6144"))
+
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
@@ -78,9 +81,12 @@ class ParallelController:
             if self._metrics is not None:
                 p = conn._last_power or {}
                 charging = not self._actual_on.get(conn.sn, True)
+                bp = p.get("bp_num")
+                cap_wh = bp * PACK_WH if bp else None
                 self._metrics.record(conn.sn, now, charging,
                                      p.get("watts_in"), p.get("watts_out"),
-                                     p.get("solar"), p.get("grid"))
+                                     p.get("solar"), p.get("grid"),
+                                     soc=conn.last_soc, cap_wh=cap_wh)
         await self.evaluate()
 
     def _rate_pct_per_hr(self, unit_key, now):
@@ -274,6 +280,15 @@ def make_web_app(ctrl):
             return web.json_response({"error": "metrics disabled"}, status=404)
         return web.json_response(ctrl._metrics.summary())
 
+    async def get_history(request):
+        if ctrl._metrics is None:
+            return web.json_response({"error": "metrics disabled"}, status=404)
+        try:
+            hours = float(request.query.get("hours", "24"))
+        except ValueError:
+            hours = 24
+        return web.json_response(ctrl._metrics.history(hours=hours))
+
     async def index(request):
         path = os.path.join(WEB_DIR, "index.html")
         if os.path.exists(path):
@@ -285,6 +300,7 @@ def make_web_app(ctrl):
         web.get("/", index),
         web.get("/api/status", get_status),
         web.get("/api/metrics", get_metrics),
+        web.get("/api/history", get_history),
         web.post("/api/control", post_control),
     ])
     if os.path.isdir(WEB_DIR):

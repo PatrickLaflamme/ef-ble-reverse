@@ -232,8 +232,9 @@ class MetricsHookTests(_CtrlBase):
         rec = []
 
         class FakeMetrics:
-            def record(self, unit, ts, charging, wi, wo, solar, grid):
-                rec.append((unit, charging, wi, wo, solar, grid))
+            def record(self, unit, ts, charging, wi, wo, solar, grid,
+                       soc=None, cap_wh=None):
+                rec.append((unit, charging, wi, wo, solar, grid, soc, cap_wh))
 
         controller.MAKE_SETTLE_SECONDS = 0
         c = controller.ParallelController(metrics=FakeMetrics())
@@ -268,6 +269,10 @@ class WebPortalTests(_CtrlBase):
                 self.assertIn("today", m)
                 self.assertIn("all_time", m)
                 self.assertIn("totals", m["today"])
+                # history endpoint
+                r = await client.get("/api/history?hours=24")
+                self.assertEqual(r.status, 200)
+                self.assertIsInstance(await r.json(), dict)
             c._metrics.close()
         finally:
             os.unlink(path)
