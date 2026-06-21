@@ -65,6 +65,33 @@ class DecideChargingUnitTests(unittest.TestCase):
         # A still charging (50, not yet 80) but load-bearing B at 10 -> switch.
         self.assertEqual(self.d({"A": 50, "B": 10}, charging="A"), "B")
 
+    # --- boundary exactness ---
+    def test_floor_inclusive_at_40(self):
+        self.assertEqual(self.d({"A": 40, "B": 90}), "A")  # <= 40
+
+    def test_floor_exclusive_at_41(self):
+        self.assertIsNone(self.d({"A": 41, "B": 90}))
+
+    def test_early_inclusive_at_50_both_below_60(self):
+        self.assertEqual(self.d({"A": 50, "B": 59}), "A")
+
+    def test_early_partner_exactly_60_blocks(self):
+        self.assertIsNone(self.d({"A": 50, "B": 60}))  # both<60 is strict
+
+    def test_window_strict_below_75(self):
+        self.assertIsNone(self.d({"A": 75, "B": 90}, now=NIGHT))  # 75 not < 75
+        self.assertEqual(self.d({"A": 74, "B": 90}, now=NIGHT), "A")
+
+    def test_target_exactly_80_releases(self):
+        self.assertIsNone(self.d({"A": 80, "B": 90}, charging="A"))
+
+    def test_critical_inclusive_at_15(self):
+        self.assertEqual(self.d({"A": 55, "B": 15}, charging="A"), "B")
+
+    def test_tie_picks_a_deterministically(self):
+        # equal SoC at floor: min() picks first inserted key ("A")
+        self.assertEqual(self.d({"A": 40, "B": 40}), "A")
+
 
 class PlanTransitionsTests(unittest.TestCase):
     def test_make_before_break_on_switch(self):

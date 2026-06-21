@@ -92,6 +92,22 @@ class StartupSeedingTests(_CtrlBase):
         await c.evaluate()
         self.assertTrue(c._actual_on["A"] and c._actual_on["B"])
 
+    async def test_partial_telemetry_defaults_missing_to_on(self):
+        # B reports no access_5p8_out_type (None) -> stays default ON.
+        c, _, _ = make_ctrl([("A", 55, 0), ("B", 70, None)])
+        c._seed_initial_state()
+        self.assertEqual(c._charging, "A")          # A (a5p8=0) is the charger
+        self.assertFalse(c._actual_on["A"])
+        self.assertTrue(c._actual_on["B"])          # None -> default ON
+
+    async def test_pd303_output_type_not_treated_as_charger(self):
+        # a5p8 == 2 (OUT_PD303): seeded off (not ==1) but NOT adopted as charger.
+        c, _, _ = make_ctrl([("A", 70, 2), ("B", 65, 1)])
+        c._seed_initial_state()
+        self.assertIsNone(c._charging)              # only a5p8==0 becomes charger
+        self.assertFalse(c._actual_on["A"])
+        self.assertTrue(c._actual_on["B"])
+
 
 class TransitionTests(_CtrlBase):
     async def test_floor_hysteresis_switch_sequence(self):
@@ -178,6 +194,36 @@ class EtaTests(unittest.IsolatedAsyncioTestCase):
         now = 1_000_000.0
         c._soc_hist["A"] = collections.deque([(now - 60, 50), (now, 51)])
         self.assertIsNone(c._eta("A", 51, True, now))
+
+    async def test_flat_soc_no_eta(self):
+        c, _, _ = make_ctrl([("A", 60, 1), ("B", 70, 1)])
+        now = 1_000_000.0
+        c._soc_hist["A"] = collections.deque([(now - 600, 60), (now - 300, 60), (now, 60)])
+        self.assertIsNone(c._eta("A", 60, True, now))   # rate 0 -> no ETA
+        self.assertIsNone(c._eta("A", 60, False, now))
+
+    async def test_wrong_sign_no_eta(self):
+        c, _, _ = make_ctrl([("A", 60, 1), ("B", 70, 1)])
+        now = 1_000_000.0
+        # SoC rising but unit marked discharging -> no needs_charge ETA
+        c._soc_hist["A"] = collections.deque([(now - 600, 55), (now - 300, 57), (now, 60)])
+        self.assertIsNone(c._eta("A", 60, False, now))
+
+    async def test_old_samples_pruned_from_window(self):
+        c, _, _ = make_ctrl([("A", 55, 0), ("B", 70, 1)])
+        now = 1_000_000.0
+        # one ancient sample (outside RATE_WINDOW_S) + recent rising ones
+        c._soc_hist["A"] = collections.deque([
+            (now - 5000, 5), (now - 600, 50), (now - 300, 52.5), (now, 55)])
+        eta = c._eta("A", 55, True, now)
+        self.assertAlmostEqual(eta["seconds"], 3000, delta=120)  # ~+30%/hr, ancient ignored
+
+    async def test_history_cleared_on_mode_switch(self):
+        c, conns, _ = make_ctrl([("A", 70, 1), ("B", 65, 1)])
+        await c.evaluate()
+        c._soc_hist["A"] = collections.deque([(1.0, 70), (2.0, 69)])
+        await c._apply("A", False)  # mode switch
+        self.assertEqual(len(c._soc_hist["A"]), 0)
 
 
 class WebPortalTests(_CtrlBase):
