@@ -22,6 +22,7 @@ echo "==> [1/6] Deploy code to $DEST"
 install -d -o ecoflow -g ecoflow "$DEST" "$DEST/web"
 install -o ecoflow -g ecoflow -m644 -t "$DEST" \
   "$REPO_DIR"/controller.py "$REPO_DIR"/policy.py "$REPO_DIR"/connect.py \
+  "$REPO_DIR"/metrics.py \
   "$REPO_DIR"/yj751_sys_pb2_v4.py "$REPO_DIR"/pd303_pb2_v4.py "$REPO_DIR"/utc_sys_pb2_v4.py
 install -o ecoflow -g ecoflow -m644 "$REPO_DIR"/web/index.html "$DEST/web/"
 # Stage requirements.txt into $DEST so the ecoflow user can read it (it cannot
@@ -95,7 +96,8 @@ if grep -q "$PLACEHOLDER" "$ENVFILE" 2>/dev/null; then
   echo "      sudo systemctl enable --now ecoflow-rotator.service"
   echo "      journalctl -u ecoflow-rotator -f"
 else
-  echo "==> Starting ecoflow-rotator.service"
-  systemctl enable --now ecoflow-rotator.service
+  echo "==> (Re)starting ecoflow-rotator.service to pick up the new code"
+  systemctl enable ecoflow-rotator.service
+  systemctl restart ecoflow-rotator.service
   echo "    watch:  journalctl -u ecoflow-rotator -f"
 fi
