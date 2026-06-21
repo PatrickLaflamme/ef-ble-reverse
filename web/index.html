@@ -30,6 +30,7 @@
   .badge.on { background:rgba(46,160,67,.18); color:var(--on); }
   .badge.charge { background:rgba(210,153,34,.18); color:var(--charge); }
   .badge.off { background:rgba(110,118,129,.2); color:var(--off); }
+  .eta { margin-top:10px; font-size:13px; font-weight:600; color:var(--fg); }
   .meta { color:var(--muted); font-size:12px; margin-top:8px; line-height:1.6; }
   .controls { margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; }
   button { background:var(--card); color:var(--fg); border:1px solid #2d3a4d;
@@ -70,6 +71,26 @@ function badge(u) {
   return '<span class="badge off">?</span>';
 }
 
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function etaLine(u) {
+  if (!u.eta) {
+    if (u.charging) return '⚡ reactivation ETA: estimating rate…';
+    if (u.on === true) return '🪫 charge ETA: estimating rate…';
+    return '';
+  }
+  const when = new Date(u.eta.ts * 1000)
+    .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const rate = u.eta.rate_pct_per_hr;
+  if (u.eta.kind === 'reactivate')
+    return `⚡ reactivates (→${u.eta.target}%) in ${fmtDur(u.eta.seconds)} · ≈${when} · +${rate}%/h`;
+  return `🪫 needs charge (→${u.eta.target}%) in ${fmtDur(u.eta.seconds)} · ≈${when} · ${rate}%/h`;
+}
+
 function render(s) {
   unitKeys = s.units.map(u => u.key);
   // flags
@@ -90,6 +111,7 @@ function render(s) {
       <div class="soc">${soc}<span style="font-size:18px;color:var(--muted)">%</span></div>
       <div class="bar"><i style="width:${pct}%"></i></div>
       ${badge(u)}
+      <div class="eta">${etaLine(u)}</div>
       <div class="meta">
         access_5p8_out_type: ${u.access_5p8_out_type ?? '—'}<br>
         show_flag: ${u.show_flag ?? '—'}<br>
@@ -104,6 +126,7 @@ function render(s) {
     `<b>Policy</b> &mdash; default BOTH ON. Charge lower unit when: ` +
     `SoC&le;${p.floor_soc}% (floor), or &le;${p.early_soc}% &amp; both&lt;${p.early_both_below}% (early), ` +
     `or window &amp; &lt;${p.window_soc}% (topup). Charge to ${p.target_soc}% then re-evaluate. ` +
+    `<b>Critical override:</b> if the discharging unit hits &le;${p.critical_soc}%, switch immediately. ` +
     `Night window ${p.window_start}&ndash;${p.window_end} UTC. Make-before-break settle ${s.settle_seconds}s.`;
   document.getElementById('ts').textContent =
     'updated ' + new Date(s.ts * 1000).toLocaleTimeString();

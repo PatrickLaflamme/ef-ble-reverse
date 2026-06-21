@@ -22,6 +22,7 @@ CLI fallback:
 """
 
 import asyncio
+import collections
 import os
 import sys
 import time
@@ -37,6 +38,11 @@ import policy
 MAKE_SETTLE_SECONDS = 5
 SCAN_SECONDS = 6.0
 
+# SoC-rate estimation for charge/discharge ETAs.
+RATE_WINDOW_S = 1800      # only use SoC samples from this trailing window
+RATE_MIN_SPAN_S = 300     # need >= this much time span for a confident rate
+SOC_HIST_MAXLEN = 720
+
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
@@ -48,6 +54,7 @@ class ParallelController:
         self._charging = None   # unit_key currently charging, or None
         self._initialized = False
         self._auto_enabled = True
+        self._soc_hist = {}     # unit_key -> deque[(ts, soc)] for rate/ETA
         self._lock = asyncio.Lock()
 
     def add(self, unit_key, conn):
@@ -56,8 +63,49 @@ class ParallelController:
         conn.set_heartbeat_callback(self._on_heartbeat)
 
     async def _on_heartbeat(self, conn):
-        self._last_seen[conn.sn] = time.time()
+        now = time.time()
+        self._last_seen[conn.sn] = now
+        if conn.last_soc is not None:
+            h = self._soc_hist.setdefault(conn.sn, collections.deque(maxlen=SOC_HIST_MAXLEN))
+            h.append((now, conn.last_soc))
         await self.evaluate()
+
+    def _rate_pct_per_hr(self, unit_key, now):
+        """Least-squares SoC slope (%/hr) over the recent window, or None."""
+        h = self._soc_hist.get(unit_key)
+        if not h:
+            return None
+        pts = [(t, s) for (t, s) in h if now - t <= RATE_WINDOW_S]
+        if len(pts) < 2 or (pts[-1][0] - pts[0][0]) < RATE_MIN_SPAN_S:
+            return None
+        n = len(pts)
+        tm = sum(t for t, _ in pts) / n
+        sm = sum(s for _, s in pts) / n
+        denom = sum((t - tm) ** 2 for t, _ in pts)
+        if denom == 0:
+            return None
+        slope = sum((t - tm) * (s - sm) for t, s in pts) / denom  # %/s
+        return slope * 3600.0
+
+    def _eta(self, unit_key, soc, is_charging, now):
+        """Project time to the next state change for one unit, or None."""
+        rate = self._rate_pct_per_hr(unit_key, now)
+        if rate is None or soc is None:
+            return None
+        if is_charging:
+            target = policy.TARGET_SOC
+            if rate <= 0 or soc >= target:
+                return None  # not actually rising / already there
+            secs = (target - soc) / rate * 3600.0
+            kind = "reactivate"
+        else:
+            target = policy.FLOOR_SOC
+            if rate >= 0 or soc <= target:
+                return None  # not actually falling / already at floor
+            secs = (soc - target) / (-rate) * 3600.0
+            kind = "needs_charge"
+        return {"kind": kind, "target": target, "seconds": int(secs),
+                "ts": now + secs, "rate_pct_per_hr": round(rate, 2)}
 
     def _soc_map(self):
         return {k: c.last_soc for k, c in self._conns.items() if c.last_soc is not None}
@@ -65,6 +113,10 @@ class ParallelController:
     async def _apply(self, unit_key, want_on):
         await self._conns[unit_key].setParallelBox(set_self=1 if want_on else 0)
         self._actual_on[unit_key] = want_on
+        # Mode boundary: discard SoC history so the rate/ETA re-estimates fresh
+        # for the new charge/discharge regime instead of mixing both sides.
+        if unit_key in self._soc_hist:
+            self._soc_hist[unit_key].clear()
         print("CTRL: unit %s -> %s" % (unit_key, "ON" if want_on else "OFF(charging)"))
 
     async def _transition_to(self, charging_unit):
@@ -134,11 +186,15 @@ class ParallelController:
         now = time.time()
         units = []
         for k, c in self._conns.items():
+            is_charging = (self._charging == k)
+            eta = self._eta(k, c.last_soc, is_charging, now)
             units.append({
                 "key": k,
                 "soc": c.last_soc,
                 "on": self._actual_on.get(k),
-                "charging": (self._charging == k),
+                "charging": is_charging,
+                "rate_pct_per_hr": self._rate_pct_per_hr(k, now),
+                "eta": eta,
                 "show_flag": c._last_show_flag,
                 "access_5p8_out_type": c._last_access_5p8_out_type,
                 "age_s": (round(now - self._last_seen[k], 1)
@@ -151,6 +207,7 @@ class ParallelController:
             "in_window": policy.in_window(),
             "units": units,
             "policy": {
+                "critical_soc": policy.CRITICAL_SOC,
                 "floor_soc": policy.FLOOR_SOC,
                 "early_soc": policy.EARLY_SOC,
                 "early_both_below": policy.EARLY_BOTH_BELOW,

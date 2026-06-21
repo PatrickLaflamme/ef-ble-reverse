@@ -27,6 +27,7 @@ the UTC window is constant - no DST math needed).
 from datetime import datetime, time, timezone
 
 # --- Tunable policy constants -------------------------------------------------
+CRITICAL_SOC = 15       # emergency: never let the load-bearing unit fall below
 FLOOR_SOC = 40          # rule 1: hard floor for the lower unit
 EARLY_SOC = 50          # rule 2: lower-unit threshold ...
 EARLY_BOTH_BELOW = 60   #         ... when BOTH units are below this
@@ -56,6 +57,19 @@ def decide_charging_unit(soc, charging=None, now=None):
     Returns:
         the unit key to charge, or None for BOTH ON.
     """
+    # Critical-low override (takes precedence over the charge-to-TARGET
+    # hysteresis): while one unit charges, the other carries the whole load. If
+    # that load-bearing unit approaches the critical floor, switch charging to
+    # it immediately so we never fully deplete and black out the load. Charge
+    # rate (~1.5 kW) exceeds typical load, so the unit coming off charge can
+    # take over and outpace discharge.
+    if charging is not None:
+        others = [u for u in soc if u != charging]
+        if others:
+            other = min(others, key=soc.get)
+            if soc[other] <= CRITICAL_SOC:
+                return other
+
     # Hysteresis: a unit that is already charging keeps charging until TARGET.
     if charging is not None and soc.get(charging, 100) < TARGET_SOC:
         return charging
@@ -124,6 +138,11 @@ if __name__ == "__main__":
         ("hysteresis: keep charging to 80",   {"A": 78, "B": 90}, "A", DAY, "A"),
         ("reached target -> release",         {"A": 80, "B": 90}, "A", DAY, None),
         ("switch: A done(80), B now floor",   {"A": 80, "B": 38}, "A", DAY, "B"),
+        # critical override: A charging, B (load-bearing) approaching 15% ->
+        # switch to charge B immediately, despite A not yet at 80.
+        ("critical: A charging, B<=15",       {"A": 55, "B": 15}, "A", DAY, "B"),
+        ("critical: B just above (16) holds A",{"A": 55, "B": 16}, "A", DAY, "A"),
+        ("critical at night too",             {"A": 60, "B": 12}, "A", NIGHT, "B"),
     ]
     ok = True
     for label, soc, charging, now, expect in cases:
