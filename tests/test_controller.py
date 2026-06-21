@@ -25,6 +25,7 @@ class FakeConn:
         self._address = sn
         self._last_show_flag = None
         self._last_access_5p8_out_type = a5p8
+        self._last_power = {}
         self.calls = []
 
     def set_heartbeat_callback(self, cb):
@@ -226,7 +227,59 @@ class EtaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(c._soc_hist["A"]), 0)
 
 
+class MetricsHookTests(_CtrlBase):
+    async def test_on_heartbeat_records_power_and_state(self):
+        rec = []
+
+        class FakeMetrics:
+            def record(self, unit, ts, charging, wi, wo, solar, grid):
+                rec.append((unit, charging, wi, wo, solar, grid))
+
+        controller.MAKE_SETTLE_SECONDS = 0
+        c = controller.ParallelController(metrics=FakeMetrics())
+        a = FakeConn("A", 70, 1)
+        b = FakeConn("B", 65, 1)
+        a._last_power = {"watts_in": 10, "watts_out": 900, "solar": 5, "grid": 0}
+        b._last_power = {"watts_in": 0, "watts_out": 0, "solar": 0, "grid": 0}
+        c.add("A", a)
+        c.add("B", b)
+        await c._on_heartbeat(a)
+        await c._on_heartbeat(b)
+        # A logged: discharging (actual_on True => charging False) with its power.
+        self.assertTrue(any(r[0] == "A" and r[1] is False and r[3] == 900 for r in rec))
+
+
 class WebPortalTests(_CtrlBase):
+    async def test_metrics_endpoint(self):
+        import os
+        import tempfile
+        from aiohttp.test_utils import TestClient, TestServer
+        from metrics import Metrics
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            c, _, _ = make_ctrl([("A", 70, 1), ("B", 65, 1)])
+            c._metrics = Metrics(path)
+            app = controller.make_web_app(c)
+            async with TestClient(TestServer(app)) as client:
+                r = await client.get("/api/metrics")
+                self.assertEqual(r.status, 200)
+                m = await r.json()
+                self.assertIn("today", m)
+                self.assertIn("all_time", m)
+                self.assertIn("totals", m["today"])
+            c._metrics.close()
+        finally:
+            os.unlink(path)
+
+    async def test_metrics_endpoint_404_when_disabled(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        c, _, _ = make_ctrl([("A", 70, 1), ("B", 65, 1)])  # no metrics
+        app = controller.make_web_app(c)
+        async with TestClient(TestServer(app)) as client:
+            r = await client.get("/api/metrics")
+            self.assertEqual(r.status, 404)
+
     async def test_status_control_index(self):
         from aiohttp.test_utils import TestClient, TestServer
         c, _, _ = make_ctrl([("A", 70, 1), ("B", 65, 1)])

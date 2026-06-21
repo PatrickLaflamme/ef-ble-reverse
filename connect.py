@@ -334,6 +334,8 @@ class Connection:
         self._last_soc = None
         self._last_show_flag = None
         self._last_access_5p8_out_type = None
+        # Latest power readings (watts) for metrics: keys watts_in/watts_out/solar/grid.
+        self._last_power = {}
         # Optional async callback invoked after each heartbeat: cb(connection).
         self._heartbeat_cb = None
 
@@ -727,6 +729,14 @@ class Connection:
                         self._last_show_flag = p.show_flag
                     if p.HasField('access_5p8_out_type'):
                         self._last_access_5p8_out_type = p.access_5p8_out_type
+                    # Power readings for metrics (solar = LV+HV MPPT, grid = AC in).
+                    _pf = lambda n: getattr(p, n) if p.HasField(n) else 0.0
+                    self._last_power = {
+                        'watts_in': _pf('watts_in_sum'),
+                        'watts_out': _pf('watts_out_sum'),
+                        'solar': _pf('in_lv_mppt_pwr') + _pf('in_hv_mppt_pwr'),
+                        'grid': _pf('in_ac_5p8_pwr') + _pf('in_ac_c20_pwr'),
+                    }
                     # Session is proven live (we just decrypted a heartbeat) -
                     # fire the optional one-shot CLI command exactly once.
                     await self.runStartupCommand()

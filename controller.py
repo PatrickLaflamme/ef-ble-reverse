@@ -34,6 +34,7 @@ from bleak_retry_connector import close_stale_connections_by_address
 import connect
 from connect import located_devices, discoveryCallback
 import policy
+from metrics import Metrics
 
 # Seconds to wait after attaching a unit before detaching the other, so the
 # newly-attached unit is carrying load before the break.
@@ -49,7 +50,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
 class ParallelController:
-    def __init__(self):
+    def __init__(self, metrics=None):
         self._conns = {}        # unit_key -> Connection
         self._actual_on = {}    # unit_key -> bool (last commanded ON state)
         self._last_seen = {}    # unit_key -> epoch of last heartbeat
@@ -57,6 +58,7 @@ class ParallelController:
         self._initialized = False
         self._auto_enabled = True
         self._soc_hist = {}     # unit_key -> deque[(ts, soc)] for rate/ETA
+        self._metrics = metrics  # optional Metrics() for energy/usage logging
         self._lock = asyncio.Lock()
 
     def add(self, unit_key, conn):
@@ -70,6 +72,15 @@ class ParallelController:
         if conn.last_soc is not None:
             h = self._soc_hist.setdefault(conn.sn, collections.deque(maxlen=SOC_HIST_MAXLEN))
             h.append((now, conn.last_soc))
+            # Record energy/usage for the interval that just ended. The charging
+            # flag reflects the state held DURING the interval (state only changes
+            # in evaluate(), below), so attribution is correct.
+            if self._metrics is not None:
+                p = conn._last_power or {}
+                charging = not self._actual_on.get(conn.sn, True)
+                self._metrics.record(conn.sn, now, charging,
+                                     p.get("watts_in"), p.get("watts_out"),
+                                     p.get("solar"), p.get("grid"))
         await self.evaluate()
 
     def _rate_pct_per_hr(self, unit_key, now):
@@ -258,6 +269,11 @@ def make_web_app(ctrl):
             return web.json_response({"error": str(e)}, status=400)
         return web.json_response(ctrl.status())
 
+    async def get_metrics(request):
+        if ctrl._metrics is None:
+            return web.json_response({"error": "metrics disabled"}, status=404)
+        return web.json_response(ctrl._metrics.summary())
+
     async def index(request):
         path = os.path.join(WEB_DIR, "index.html")
         if os.path.exists(path):
@@ -268,6 +284,7 @@ def make_web_app(ctrl):
     app.add_routes([
         web.get("/", index),
         web.get("/api/status", get_status),
+        web.get("/api/metrics", get_metrics),
         web.post("/api/control", post_control),
     ])
     if os.path.isdir(WEB_DIR):
@@ -284,6 +301,17 @@ async def start_web(ctrl, host, port):
     await site.start()
     print("INFO: portal listening on http://%s:%d" % (host, port))
     return runner
+
+
+def _db_path():
+    """Where to persist metrics. systemd StateDirectory=ecoflow sets
+    STATE_DIRECTORY=/var/lib/ecoflow; fall back to ECOFLOW_DB, then cwd."""
+    if os.environ.get("ECOFLOW_DB"):
+        return os.environ["ECOFLOW_DB"]
+    state = os.environ.get("STATE_DIRECTORY")
+    if state:
+        return os.path.join(state.split(":")[0], "metrics.db")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 
 
 async def main(user_id, addresses, http_host="127.0.0.1", http_port=8787):
@@ -317,7 +345,9 @@ async def main(user_id, addresses, http_host="127.0.0.1", http_port=8787):
         key = dev._sn or ("unit%d" % i)
         devices.append((key, dev))
 
-    ctrl = ParallelController()
+    db_path = _db_path()
+    print("INFO: metrics db: %s" % db_path)
+    ctrl = ParallelController(metrics=Metrics(db_path))
     await start_web(ctrl, http_host, http_port)
 
     print("INFO: connecting to: %s" % [k for k, _ in devices])

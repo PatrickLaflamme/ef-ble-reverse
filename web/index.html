@@ -38,6 +38,16 @@
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
   button:disabled { opacity:.5; cursor:default; }
+  .mh { font-size:14px; font-weight:600; margin:26px 0 10px; color:var(--fg); }
+  .seg { display:inline-flex; gap:0; margin-bottom:12px; border:1px solid #2d3a4d; border-radius:8px; overflow:hidden; }
+  .segbtn { background:var(--card); border:0; border-radius:0; padding:6px 14px; font-size:13px; }
+  .segbtn.active { background:var(--accent); color:#fff; }
+  table.m { width:100%; border-collapse:collapse; font-size:13px; }
+  table.m th, table.m td { text-align:right; padding:7px 8px; border-bottom:1px solid #222c3a; }
+  table.m th:first-child, table.m td:first-child { text-align:left; font-family:ui-monospace,monospace; color:var(--muted); }
+  table.m thead th { color:var(--muted); font-weight:600; }
+  table.m tfoot td { font-weight:700; border-top:2px solid #2d3a4d; border-bottom:0; }
+  .solar { color:var(--charge); }
   .policy { margin-top:22px; color:var(--muted); font-size:12px; line-height:1.7;
             border-top:1px solid #222c3a; padding-top:14px; }
   .err { color:var(--err); font-size:13px; margin-top:10px; min-height:18px; }
@@ -58,6 +68,12 @@
     <button data-action="charge" data-unit="1" id="chgB">Charge B</button>
   </div>
   <div class="err" id="err"></div>
+  <h2 class="mh">Energy &amp; usage</h2>
+  <div class="seg" id="seg">
+    <button class="segbtn active" data-scope="today">Today</button>
+    <button class="segbtn" data-scope="all_time">All time</button>
+  </div>
+  <div id="metrics"></div>
   <div class="policy" id="policy"></div>
   <div class="ts" id="ts"></div>
 </main>
@@ -132,6 +148,62 @@ function render(s) {
     'updated ' + new Date(s.ts * 1000).toLocaleTimeString();
 }
 
+let metricsScope = 'today';
+
+function fmtHrs(s) {
+  if (s == null) return '—';
+  const h = s / 3600;
+  return h >= 1 ? h.toFixed(1) + 'h' : (s / 60).toFixed(0) + 'm';
+}
+function kwh(wh) { return wh == null ? '—' : (wh / 1000).toFixed(2); }
+
+function renderMetrics(m) {
+  if (!m || m.error) {
+    document.getElementById('metrics').innerHTML =
+      '<div class="meta">metrics unavailable</div>';
+    return;
+  }
+  const scope = m[metricsScope];
+  const units = Object.keys(scope.per_unit);
+  const row = (label, u) =>
+    `<tr><td>${label}</td>
+       <td>${fmtHrs(u.charge_s)}</td>
+       <td class="solar">${kwh(u.solar_wh)}</td>
+       <td>${kwh(u.grid_wh)}</td>
+       <td>${kwh(u.in_wh)}</td>
+       <td>${kwh(u.out_wh)}</td>
+       <td>${kwh(u.delta_wh)}</td></tr>`;
+  const body = units.map((k, i) =>
+    row('Unit ' + String.fromCharCode(65 + i) + ' · ' + k, scope.per_unit[k])).join('');
+  const t = scope.totals;
+  document.getElementById('metrics').innerHTML = `
+    <table class="m">
+      <thead><tr><th>unit</th><th>charging</th><th>solar kWh</th>
+        <th>grid kWh</th><th>in kWh</th><th>out kWh</th><th>in&minus;out kWh</th></tr></thead>
+      <tbody>${body || '<tr><td colspan=7 class="meta">no data yet</td></tr>'}</tbody>
+      <tfoot><tr><td>Total</td><td>${fmtHrs(t.charge_s)}</td>
+        <td class="solar">${kwh(t.solar_wh)}</td><td>${kwh(t.grid_wh)}</td>
+        <td>${kwh(t.in_wh)}</td><td>${kwh(t.out_wh)}</td><td>${kwh(t.delta_wh)}</td></tr></tfoot>
+    </table>
+    <div class="meta">in&minus;out kWh = energy stored in batteries + conversion/standby losses
+      (&approx; pure loss over a full charge/discharge cycle).</div>`;
+}
+
+async function refreshMetrics() {
+  try {
+    const r = await fetch('/api/metrics');
+    renderMetrics(await r.json());
+  } catch (e) { /* keep previous */ }
+}
+
+document.querySelectorAll('.segbtn').forEach(b => {
+  b.addEventListener('click', () => {
+    metricsScope = b.dataset.scope;
+    document.querySelectorAll('.segbtn').forEach(x => x.classList.toggle('active', x === b));
+    refreshMetrics();
+  });
+});
+
 async function refresh() {
   try {
     const r = await fetch('/api/status');
@@ -164,7 +236,9 @@ document.querySelectorAll('button[data-action]').forEach(b => {
 });
 
 refresh();
+refreshMetrics();
 setInterval(refresh, 3000);
+setInterval(refreshMetrics, 15000);
 </script>
 </body>
 </html>

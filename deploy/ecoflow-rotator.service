@@ -12,6 +12,10 @@ Group=ecoflow
 EnvironmentFile=/etc/ecoflow/rotator.env
 WorkingDirectory=/opt/ecoflow-rotator
 ExecStart=/opt/ecoflow-rotator/.venv/bin/python /opt/ecoflow-rotator/controller.py
+# Writable state dir for the metrics SQLite db (ProtectSystem=strict makes the
+# rest read-only). systemd creates /var/lib/ecoflow, chowns it to ecoflow, and
+# exports STATE_DIRECTORY=/var/lib/ecoflow which controller.py uses for the db.
+StateDirectory=ecoflow
 
 # Resilience: bleak/bleak-retry reconnect internally; if the process dies,
 # systemd restarts it.
