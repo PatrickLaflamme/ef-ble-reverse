@@ -119,30 +119,37 @@ class ParallelController:
             self._soc_hist[unit_key].clear()
         print("CTRL: unit %s -> %s" % (unit_key, "ON" if want_on else "OFF(charging)"))
 
+    def _seed_initial_state(self):
+        """On first run, infer each unit's ON/OFF state and any in-progress
+        charger from live telemetry instead of assuming both ON.
+
+        access_5p8_out_type: 1 = attached to parallel box (ON/discharging),
+        0 = detached (OFF/charging). Seeding from this means we only send the
+        commands actually needed (no needless toggling if already in the right
+        state) and we preserve a charge already in progress across a restart.
+        """
+        if self._initialized:
+            return
+        detached = []
+        for u in self._conns:
+            a = self._conns[u]._last_access_5p8_out_type
+            if a is None:
+                continue  # no telemetry yet for this unit; keep default (ON)
+            self._actual_on[u] = (a == 1)
+            if a == 0:
+                detached.append(u)
+        # Exactly one detached unit is the current charger: adopt it as
+        # self._charging so the charge-to-TARGET hysteresis continues it instead
+        # of yanking it back to discharge on the next evaluation.
+        if len(detached) == 1:
+            self._charging = detached[0]
+        self._initialized = True
+        print("CTRL: seeded initial state from telemetry: actual_on=%s charging=%s"
+              % (self._actual_on, self._charging))
+
     async def _transition_to(self, charging_unit):
         """Drive the system to the given charging target. Assumes lock held."""
         units = list(self._conns)
-
-        if not self._initialized:
-            # Force both units to their desired state once at startup, since we
-            # don't actually know the hardware state. Commands are idempotent;
-            # emit ON (make) before OFF (break).
-            desired_on = {u: True for u in units}
-            if charging_unit is not None:
-                desired_on[charging_unit] = False
-            order = ([u for u in units if desired_on[u]] +
-                     [u for u in units if not desired_on[u]])
-            print("CTRL: init -> charging=%s" % charging_unit)
-            made = False
-            for u in order:
-                if not desired_on[u] and made:
-                    await asyncio.sleep(MAKE_SETTLE_SECONDS)
-                await self._apply(u, desired_on[u])
-                made = made or desired_on[u]
-            self._charging = charging_unit
-            self._initialized = True
-            return
-
         actions = policy.plan_transitions(charging_unit, units, self._actual_on)
         if not actions:
             self._charging = charging_unit
@@ -162,6 +169,7 @@ class ParallelController:
             soc = self._soc_map()
             if len(soc) < len(self._conns):
                 return  # wait until both units have reported SoC
+            self._seed_initial_state()
             charging_unit = policy.decide_charging_unit(soc, self._charging)
             await self._transition_to(charging_unit)
 
@@ -173,6 +181,7 @@ class ParallelController:
         async with self._lock:
             if charging_unit is not None and charging_unit not in self._conns:
                 raise ValueError("unknown unit %r" % charging_unit)
+            self._seed_initial_state()
             self._auto_enabled = False
             await self._transition_to(charging_unit)
 
