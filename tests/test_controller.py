@@ -194,7 +194,29 @@ class EtaTests(unittest.IsolatedAsyncioTestCase):
         c, _, _ = make_ctrl([("A", 51, 1), ("B", 70, 1)])
         now = 1_000_000.0
         c._soc_hist["A"] = collections.deque([(now - 60, 50), (now, 51)])
-        self.assertIsNone(c._eta("A", 51, True, now))
+        self.assertIsNone(c._eta("A", 51, True, now))  # no power, short slope
+
+    async def test_power_based_rate_when_soc_flat(self):
+        # SoC flat (slope 0) but net discharge power present -> ETA from power.
+        c, _, _ = make_ctrl([("A", 44, 1), ("B", 70, 1)])
+        now = 1_000_000.0
+        c._soc_hist["A"] = collections.deque([(now - 600, 44), (now, 44)])  # flat
+        power = {"watts_in": 0, "watts_out": 600}  # 600W net out
+        cap = 12288  # 2 packs
+        eta = c._eta("A", 44, False, now, power, cap)
+        self.assertEqual(eta["kind"], "needs_charge")
+        # rate = -600/12288*100 = -4.88%/hr; to floor 40: 4/4.88*3600 ~ 2951s
+        self.assertAlmostEqual(eta["rate_pct_per_hr"], -4.88, delta=0.1)
+        self.assertAlmostEqual(eta["seconds"], 2951, delta=120)
+
+    async def test_power_based_charge_eta(self):
+        c, _, _ = make_ctrl([("A", 50, 0), ("B", 70, 1)])
+        now = 1_000_000.0
+        power = {"watts_in": 1500, "watts_out": 0}  # charging at 1.5kW
+        cap = 12288
+        eta = c._eta("A", 50, True, now, power, cap)
+        self.assertEqual(eta["kind"], "reactivate")  # rate +12.2%/hr -> ~2h to 80
+        self.assertGreater(eta["rate_pct_per_hr"], 0)
 
     async def test_flat_soc_no_eta(self):
         c, _, _ = make_ctrl([("A", 60, 1), ("B", 70, 1)])

@@ -106,9 +106,19 @@ class ParallelController:
         slope = sum((t - tm) * (s - sm) for t, s in pts) / denom  # %/s
         return slope * 3600.0
 
-    def _eta(self, unit_key, soc, is_charging, now):
+    def _soc_rate(self, unit_key, now, power, cap_wh):
+        """SoC rate in %/hr. Prefer net power / capacity (instant, not
+        quantized); fall back to the observed SoC slope when power/capacity
+        aren't available."""
+        if power and cap_wh:
+            net = (power.get("watts_in") or 0.0) - (power.get("watts_out") or 0.0)
+            if abs(net) >= 1.0:  # ignore idle noise
+                return net / cap_wh * 100.0  # +rising / -falling
+        return self._rate_pct_per_hr(unit_key, now)
+
+    def _eta(self, unit_key, soc, is_charging, now, power=None, cap_wh=None):
         """Project time to the next state change for one unit, or None."""
-        rate = self._rate_pct_per_hr(unit_key, now)
+        rate = self._soc_rate(unit_key, now, power, cap_wh)
         if rate is None or soc is None:
             return None
         if is_charging:
@@ -215,13 +225,20 @@ class ParallelController:
         units = []
         for k, c in self._conns.items():
             is_charging = (self._charging == k)
-            eta = self._eta(k, c.last_soc, is_charging, now)
+            power = getattr(c, "_last_power", None) or {}
+            bp = power.get("bp_num")
+            cap_wh = bp * PACK_WH if bp else None
+            eta = self._eta(k, c.last_soc, is_charging, now, power, cap_wh)
+            rate = self._soc_rate(k, now, power, cap_wh)
             units.append({
                 "key": k,
                 "soc": c.last_soc,
                 "on": self._actual_on.get(k),
                 "charging": is_charging,
-                "rate_pct_per_hr": self._rate_pct_per_hr(k, now),
+                "watts_in": power.get("watts_in"),
+                "watts_out": power.get("watts_out"),
+                "solar_w": power.get("solar"),
+                "rate_pct_per_hr": round(rate, 2) if rate is not None else None,
                 "eta": eta,
                 "show_flag": c._last_show_flag,
                 "access_5p8_out_type": c._last_access_5p8_out_type,
