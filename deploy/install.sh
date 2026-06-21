@@ -82,14 +82,14 @@ if ! grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' /etc/nginx/nginx.conf; th
   sed -i '0,/^\s*http\s*{/s//http {\n    include \/etc\/nginx\/conf.d\/*.conf;/' /etc/nginx/nginx.conf
   echo "    added 'include /etc/nginx/conf.d/*.conf;' to nginx.conf http{}"
 fi
-grep -q 'ecoflow-controller.local' /etc/hosts || \
-  echo '127.0.0.1   ecoflow-controller.local' >>/etc/hosts
 nginx -t
 systemctl enable --now nginx
 systemctl reload nginx || systemctl restart nginx
 
 echo
-echo "==> nginx is up. Portal proxied at http://ecoflow-controller.local"
+echo "==> nginx is up. Portal served ONLY for http://ecoflow-controller.lan"
+echo "    Point ecoflow-controller.lan at this box's LAN IP via your router DNS"
+echo "    (a non-.local name so macOS/iOS resolve it over unicast DNS)."
 if grep -q "$PLACEHOLDER" "$ENVFILE" 2>/dev/null; then
   echo "==> NEXT: edit $ENVFILE (still has placeholder values), then:"
   echo "      sudo systemctl enable --now ecoflow-rotator.service"
