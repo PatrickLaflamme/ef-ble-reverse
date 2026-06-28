@@ -320,6 +320,12 @@ class Connection:
     NOTIFY_CHARACTERISTIC = "00000003-0000-1000-8000-00805f9b34fb"
     WRITE_CHARACTERISTIC = "00000002-0000-1000-8000-00805f9b34fb"
 
+    # Self-healing reconnect backoff (seconds): start here, double on each
+    # failure, cap at max. A single, guarded loop replaces the old
+    # fire-and-forget reconnect that could storm the adapter.
+    RECONNECT_BASE_DELAY = 5
+    RECONNECT_MAX_DELAY = 60
+
     def __init__(self, ble_dev, dev_sn):
         self._ble_dev = ble_dev
         self._address = ble_dev.address
@@ -328,6 +334,8 @@ class Connection:
         self._retry_on_disconnect = True
         self._disconnected = asyncio.Event()
         self._client = None
+        # Guards against overlapping reconnect loops (see _reconnect_loop).
+        self._reconnecting = False
         self._enc_packet_buffer = b''
         self._startup_cmd_fired = False
         # Latest values parsed from AppShowHeartbeatReport, for external control.
@@ -502,21 +510,23 @@ class Connection:
 
     async def connect(self, max_attempts: int = MAX_CONNECT_ATTEMPTS):
         self._retry_on_disconnect = True
+        if self._client is not None and self._client.is_connected:
+            print("%s: INFO: is already connected" % (self._address,))
+            return
         try:
-            if self._client != None:
-                if self._client.is_connected:
-                    print("%s: INFO: is already connected" % (self._address,))
-                    return
-                await self._client.connect()
-            else:
-                self._client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    self.ble_device_callback(),
-                    self._ble_dev.name,
-                    disconnected_callback=self.disconnected,
-                    ble_device_callback=self.ble_device_callback,
-                    max_attempts=max_attempts,
-                )
+            # Always (re)establish through bleak_retry_connector. It calls
+            # close_stale_connections_by_address first, clearing any half-open
+            # BlueZ handle. Reusing a stale client (await self._client.connect())
+            # throws org.bluez.Error.Failed "Not connected" / InProgress and
+            # leaves the device permanently unreachable.
+            self._client = await establish_connection(
+                BleakClientWithServiceCache,
+                self.ble_device_callback(),
+                self._ble_dev.name,
+                disconnected_callback=self.disconnected,
+                ble_device_callback=self.ble_device_callback,
+                max_attempts=max_attempts,
+            )
         except (asyncio.TimeoutError, BleakError) as err:
             print("%s: Failed to connect to the device: %s" % (self._address, err))
             raise err
@@ -535,11 +545,46 @@ class Connection:
 
     def disconnected(self, *args, **kwargs) -> None:
         print("%s: Disconnected from device callback" % (self._address,))
+        # Drop the dead client so the next connect() goes through
+        # establish_connection (which clears stale BlueZ state) rather than
+        # reusing a half-open handle.
+        self._client = None
         if self._retry_on_disconnect:
             loop = asyncio.get_event_loop()
-            loop.create_task(self.connect())
+            loop.create_task(self._reconnect_loop())
         else:
             self._disconnected.set()
+
+    async def _reconnect_loop(self) -> None:
+        """Single, self-healing reconnect driver.
+
+        The old code fired a fresh ``create_task(self.connect())`` on every
+        disconnect with no guard and no rescheduling. On a flaky link those
+        tasks piled up, collided in BlueZ (org.bluez.Error.InProgress), all
+        died with unretrieved exceptions, and once the storm burned out nothing
+        retried — a single dropped link became a permanent outage. This loop
+        runs at most once at a time and keeps retrying with backoff until it
+        reconnects or shutdown() clears the retry flag.
+        """
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        delay = self.RECONNECT_BASE_DELAY
+        try:
+            while self._retry_on_disconnect:
+                try:
+                    await self.connect()
+                    print("%s: INFO: Reconnected" % (self._address,))
+                    return
+                except Exception as err:
+                    print(
+                        "%s: WARN: reconnect failed, retrying in %ds: %s"
+                        % (self._address, delay, err)
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
+        finally:
+            self._reconnecting = False
 
     async def sendRequest(self, send_data: bytes, response_handler = None):
         print("%s: Sending: %r" % (self._address, bytearray(send_data).hex()))
