@@ -21,9 +21,24 @@ from fastcrc import crc16, crc8
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
+import os
+
 import utc_sys_pb2_v4 as utc_sys_pb2
 import yj751_sys_pb2_v4 as yj751_sys_pb2
 import pd303_pb2_v4 as pd303_pb2
+
+# Per-heartbeat protobuf dumps and per-packet hex are firehose-level noise: a
+# single heartbeat's str(proto) is ~60 journal lines, emitted every few seconds
+# per unit, which buries lifecycle/command/error lines (this is what hid the
+# 2026-06-27 disconnect). Silenced by default; set EF_BLE_DEBUG=1 to restore
+# them for protocol debugging.
+_VERBOSE = os.environ.get("EF_BLE_DEBUG", "") not in ("", "0", "false", "False")
+
+
+def _vlog(*args, **kwargs):
+    """print(), but only when EF_BLE_DEBUG is set. For firehose-level dumps."""
+    if _VERBOSE:
+        print(*args, **kwargs)
 
 # When you device is bond to your account - it's storing the user_id,
 # which is on of the keys in auth procedure, so UserID need to be extracted.
@@ -418,7 +433,7 @@ class Connection:
 
     async def parseSimple(self, data: str):
         '''Deserializes bytes stream into the simple bytes'''
-        print("%s: ParseSimple: %r" % (self._address, bytearray(data).hex()))
+        _vlog("%s: ParseSimple: %r" % (self._address, bytearray(data).hex()))
 
         header = data[0:6]
         data_end = 6 + struct.unpack('<H', header[4:6])[0]
@@ -439,7 +454,7 @@ class Connection:
             data = self._enc_packet_buffer + data
             self._enc_packet_buffer = b''
 
-        print("%s: ParseEncPackets: %r" % (self._address, bytearray(data).hex()))
+        _vlog("%s: ParseEncPackets: %r" % (self._address, bytearray(data).hex()))
         if len(data) < 8:
             print("%s: ERROR: Unable to parse encrypted packet - too small: %r" % (self._address, bytearray(data).hex()))
             return None
@@ -470,7 +485,7 @@ class Connection:
 
             # Decrypt the payload packet
             payload = await self.decryptSession(payload_data)
-            print("%s: ParseEncPackets: decrypted payload: %r" % (self._address, bytearray(payload).hex()))
+            _vlog("%s: ParseEncPackets: decrypted payload: %r" % (self._address, bytearray(payload).hex()))
 
             # Parse packet - Y needs xor
             packet = Packet.fromBytes(payload, self._dev_sn.startswith('Y711'))
@@ -587,13 +602,13 @@ class Connection:
             self._reconnecting = False
 
     async def sendRequest(self, send_data: bytes, response_handler = None):
-        print("%s: Sending: %r" % (self._address, bytearray(send_data).hex()))
+        _vlog("%s: Sending: %r" % (self._address, bytearray(send_data).hex()))
         if response_handler:
             await self._client.start_notify(Connection.NOTIFY_CHARACTERISTIC, response_handler)
         await self._client.write_gatt_char(Connection.WRITE_CHARACTERISTIC, bytearray(send_data))
 
     async def sendPacket(self, packet: Packet, response_handler = None):
-        print("%s: Sending packet: %r" % (self._address, packet))
+        _vlog("%s: Sending packet: %r" % (self._address, packet))
         # Wrapping and encrypting with session key
         to_send = EncPacket(
             EncPacket.FRAME_TYPE_PROTOCOL, EncPacket.PAYLOAD_TYPE_VX_PROTOCOL,
@@ -729,18 +744,18 @@ class Connection:
                     p.ParseFromString(packet.payload)
                     processed = True
                     send_reply = True
-                    print("PD303 ProtoTime:", str(p))
+                    _vlog("PD303 ProtoTime:", str(p))
                 elif packet.cmdId == 0x20:
                     p = pd303_pb2.ProtoPushAndSet()
                     p.ParseFromString(packet.payload)
                     processed = True
                     send_reply = True
-                    print("PD303 ProtoPushAndSet:", str(p))
+                    _vlog("PD303 ProtoPushAndSet:", str(p))
                 elif packet.cmdId == 0x21:
                     p = pd303_pb2.ProtoPushAndSet()
                     p.ParseFromString(packet.payload)
                     processed = True
-                    print("PD303 isGetCfgFlag back:", str(p))
+                    _vlog("PD303 isGetCfgFlag back:", str(p))
             elif packet.src == 0x0B and packet.cmdSet == 0x01 and packet.cmdId == 0x55:
                 # Device is ready so send it the config request
                 print("%s: PD303: Requesting config from device" % (self._address,))
@@ -766,7 +781,7 @@ class Connection:
                     p.ParseFromString(packet.payload)
                     processed = True
                     send_reply = True
-                    print("YJ751 AppShowHeartbeatReport:", str(p))
+                    _vlog("YJ751 AppShowHeartbeatReport:", str(p))
                     # Capture fields used by the external controller.
                     if p.HasField('soc'):
                         self._last_soc = p.soc
@@ -793,19 +808,19 @@ class Connection:
                     p.ParseFromString(packet.payload)
                     processed = True
                     send_reply = True
-                    print("YJ751 BackendRecordHeartbeatReport:", str(p))
+                    _vlog("YJ751 BackendRecordHeartbeatReport:", str(p))
                 elif packet.cmdId == 0x03:  # Configs
                     p = yj751_sys_pb2.APPParaHeartbeatReport()
                     p.ParseFromString(packet.payload)
                     processed = True
                     send_reply = True
-                    print("YJ751 APPParaHeartbeatReport:", str(p))
+                    _vlog("YJ751 APPParaHeartbeatReport:", str(p))
                 elif packet.cmdId == 0x04:  # Battery package info
                     p = yj751_sys_pb2.BpInfoReport()
                     p.ParseFromString(packet.payload)
                     processed = True
                     send_reply = True
-                    print("YJ751 BpInfoReport:", str(p))
+                    _vlog("YJ751 BpInfoReport:", str(p))
             elif packet.src == 0x06 and packet.cmdSet == 0xFE and packet.cmdId == 0x10:
                 # TODO: Not quite sure it's the right message type - but most probably
                 p = yj751_sys_pb2.ProductInfoGetAck()
