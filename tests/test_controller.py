@@ -26,10 +26,14 @@ class FakeConn:
         self._last_show_flag = None
         self._last_access_5p8_out_type = a5p8
         self._last_power = {}
+        self._rssi = None
         self.calls = []
 
     def set_heartbeat_callback(self, cb):
         self._cb = cb
+
+    def set_event_callback(self, cb):
+        self._event_cb = cb
 
     async def setParallelBox(self, set_self=None, set_para=None):
         self.calls.append(set_self)
@@ -255,7 +259,7 @@ class MetricsHookTests(_CtrlBase):
 
         class FakeMetrics:
             def record(self, unit, ts, charging, wi, wo, solar, grid,
-                       soc=None, cap_wh=None):
+                       soc=None, cap_wh=None, rssi=None):
                 rec.append((unit, charging, wi, wo, solar, grid, soc, cap_wh))
 
         controller.MAKE_SETTLE_SECONDS = 0

@@ -48,33 +48,51 @@ class Metrics:
             """CREATE TABLE IF NOT EXISTS samples(
                    unit TEXT NOT NULL, ts REAL NOT NULL,
                    soc REAL, watts_in REAL, watts_out REAL,
-                   solar_w REAL, grid_w REAL)""")
+                   solar_w REAL, grid_w REAL, rssi REAL)""")
         self._db.execute("CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts)")
+        # migrate older dbs that predate rssi
+        scols = [r[1] for r in self._db.execute("PRAGMA table_info(samples)")]
+        if "rssi" not in scols:
+            self._db.execute("ALTER TABLE samples ADD COLUMN rssi REAL")
+        # BLE connection lifecycle events for drop-rate / uptime stats.
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS conn_events(
+                   unit TEXT NOT NULL, ts REAL NOT NULL, event TEXT NOT NULL)""")
+        self._db.execute("CREATE INDEX IF NOT EXISTS conn_events_ts ON conn_events(ts)")
         self._db.commit()
         self._last_ts = {}      # unit -> last sample timestamp
         self._last_soc = {}     # unit -> last soc
         self._last_sample = {}  # unit -> last time-series row timestamp
 
-    def _maybe_sample(self, unit, ts, soc, watts_in, watts_out, solar_w, grid_w):
+    def _maybe_sample(self, unit, ts, soc, watts_in, watts_out, solar_w, grid_w,
+                      rssi=None):
         last = self._last_sample.get(unit)
         if last is not None and (ts - last) < SAMPLE_INTERVAL_S:
             return
         self._last_sample[unit] = ts
         self._db.execute(
-            "INSERT INTO samples(unit, ts, soc, watts_in, watts_out, solar_w, grid_w) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (unit, ts, soc, watts_in, watts_out, solar_w, grid_w))
+            "INSERT INTO samples(unit, ts, soc, watts_in, watts_out, solar_w, grid_w, rssi) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (unit, ts, soc, watts_in, watts_out, solar_w, grid_w, rssi))
         self._db.execute("DELETE FROM samples WHERE ts < ?", (ts - RETENTION_S,))
 
+    def record_event(self, unit, ts, event):
+        """Log a BLE lifecycle event ('connect'/'disconnect'/'reconnect_fail')."""
+        self._db.execute(
+            "INSERT INTO conn_events(unit, ts, event) VALUES (?,?,?)",
+            (unit, ts, event))
+        self._db.execute("DELETE FROM conn_events WHERE ts < ?", (ts - RETENTION_S,))
+        self._db.commit()
+
     def record(self, unit, ts, charging, watts_in, watts_out, solar_w, grid_w,
-               soc=None, cap_wh=None):
+               soc=None, cap_wh=None, rssi=None):
         """Integrate one heartbeat sample for a unit. Returns the dt used (or 0)."""
         last = self._last_ts.get(unit)
         last_soc = self._last_soc.get(unit)
         self._last_ts[unit] = ts
         self._last_soc[unit] = soc
 
-        self._maybe_sample(unit, ts, soc, watts_in, watts_out, solar_w, grid_w)
+        self._maybe_sample(unit, ts, soc, watts_in, watts_out, solar_w, grid_w, rssi)
 
         if last is None:
             self._db.commit()
@@ -155,12 +173,52 @@ class Metrics:
         cutoff = now - hours * 3600
         out = {}
         for r in self._db.execute(
-                "SELECT unit, ts, soc, watts_in, watts_out, solar_w, grid_w "
+                "SELECT unit, ts, soc, watts_in, watts_out, solar_w, grid_w, rssi "
                 "FROM samples WHERE ts >= ? ORDER BY ts", (cutoff,)):
             out.setdefault(r[0], []).append({
                 "ts": r[1], "soc": r[2], "watts_in": r[3], "watts_out": r[4],
-                "solar_w": r[5], "grid_w": r[6],
+                "solar_w": r[5], "grid_w": r[6], "rssi": r[7],
             })
+        return out
+
+    def health(self, now_ts=None, windows=(3600, 86400)):
+        """Per-unit connection health: drop counts per window, reconnect
+        failures, and the most recent RSSI sample. Units are any seen in
+        either conn_events or samples."""
+        import time as _time
+        now = now_ts if now_ts is not None else _time.time()
+
+        units = set()
+        for r in self._db.execute("SELECT DISTINCT unit FROM conn_events"):
+            units.add(r[0])
+        for r in self._db.execute("SELECT DISTINCT unit FROM samples"):
+            units.add(r[0])
+
+        out = {}
+        for u in units:
+            drops = {}
+            rfails = {}
+            for w in windows:
+                cutoff = now - w
+                label = "%dh" % (w // 3600)
+                drops[label] = self._db.execute(
+                    "SELECT COUNT(*) FROM conn_events "
+                    "WHERE unit=? AND event='disconnect' AND ts>=?",
+                    (u, cutoff)).fetchone()[0]
+                rfails[label] = self._db.execute(
+                    "SELECT COUNT(*) FROM conn_events "
+                    "WHERE unit=? AND event='reconnect_fail' AND ts>=?",
+                    (u, cutoff)).fetchone()[0]
+            row = self._db.execute(
+                "SELECT rssi, ts FROM samples "
+                "WHERE unit=? AND rssi IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                (u,)).fetchone()
+            out[u] = {
+                "drops": drops,
+                "reconnect_fails": rfails,
+                "last_rssi": row[0] if row else None,
+                "last_rssi_ts": row[1] if row else None,
+            }
         return out
 
     def close(self):

@@ -35,6 +35,7 @@ import connect
 from connect import located_devices, discoveryCallback
 import policy
 from metrics import Metrics
+import betterstack
 
 # Seconds to wait after attaching a unit before detaching the other, so the
 # newly-attached unit is carrying load before the break.
@@ -53,7 +54,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
 class ParallelController:
-    def __init__(self, metrics=None):
+    def __init__(self, metrics=None, betterstack=None):
         self._conns = {}        # unit_key -> Connection
         self._actual_on = {}    # unit_key -> bool (last commanded ON state)
         self._last_seen = {}    # unit_key -> epoch of last heartbeat
@@ -62,12 +63,24 @@ class ParallelController:
         self._auto_enabled = True
         self._soc_hist = {}     # unit_key -> deque[(ts, soc)] for rate/ETA
         self._metrics = metrics  # optional Metrics() for energy/usage logging
+        self._bs = betterstack   # optional BetterStackEmitter for remote metrics
         self._lock = asyncio.Lock()
 
     def add(self, unit_key, conn):
         self._conns[unit_key] = conn
         self._actual_on[unit_key] = True  # provisional; first eval forces real state
         conn.set_heartbeat_callback(self._on_heartbeat)
+        conn.set_event_callback(self._on_conn_event)
+
+    def _on_conn_event(self, conn, event):
+        """BLE lifecycle event from a Connection ('connect'/'disconnect'/
+        'reconnect_fail'); persist it for drop-rate metrics."""
+        now = time.time()
+        print("CTRL: unit %s BLE event: %s" % (conn.sn, event))
+        if self._metrics is not None:
+            self._metrics.record_event(conn.sn, now, event)
+        if self._bs is not None:
+            self._bs.emit_event(conn.sn, now, event)
 
     async def _on_heartbeat(self, conn):
         now = time.time()
@@ -86,7 +99,18 @@ class ParallelController:
                 self._metrics.record(conn.sn, now, charging,
                                      p.get("watts_in"), p.get("watts_out"),
                                      p.get("solar"), p.get("grid"),
-                                     soc=conn.last_soc, cap_wh=cap_wh)
+                                     soc=conn.last_soc, cap_wh=cap_wh,
+                                     rssi=getattr(conn, "_rssi", None))
+            if self._bs is not None:
+                p = conn._last_power or {}
+                self._bs.maybe_emit_sample(conn.sn, now, {
+                    "soc": conn.last_soc,
+                    "watts_in": p.get("watts_in"),
+                    "watts_out": p.get("watts_out"),
+                    "solar_w": p.get("solar"),
+                    "grid_w": p.get("grid"),
+                    "rssi": getattr(conn, "_rssi", None),
+                })
         await self.evaluate()
 
     def _rate_pct_per_hr(self, unit_key, now):
@@ -238,6 +262,7 @@ class ParallelController:
                 "watts_in": power.get("watts_in"),
                 "watts_out": power.get("watts_out"),
                 "solar_w": power.get("solar"),
+                "rssi": getattr(c, "_rssi", None),
                 "rate_pct_per_hr": round(rate, 2) if rate is not None else None,
                 "eta": eta,
                 "show_flag": c._last_show_flag,
@@ -264,6 +289,63 @@ class ParallelController:
             "settle_seconds": MAKE_SETTLE_SECONDS,
             "ts": now,
         }
+
+
+# --- Better Stack heartbeat watchdog ------------------------------------------
+# Dead-man's switch: while a unit's BLE link is fresh we ping its Better Stack
+# heartbeat URL; if the link goes stale we WITHHOLD the ping, so Better Stack's
+# grace window lapses and it pages us — naming the specific unit. Controller
+# death stops all pings, so that's covered too. Configure each Better Stack
+# heartbeat for ~30s period + ~30s grace to alert at ~60s of BT silence.
+WATCHDOG_TICK_S = int(os.environ.get("WATCHDOG_TICK_S", "15"))
+HEARTBEAT_FRESH_S = int(os.environ.get("HEARTBEAT_FRESH_S", "30"))
+
+
+async def _ping(session, url, label):
+    """GET a heartbeat URL; never raise (a failed ping must not kill the loop).
+    The URL is a secret, so only the label is logged."""
+    try:
+        async with session.get(url) as resp:
+            await resp.read()
+    except Exception as e:
+        print("WARN: heartbeat ping (%s) failed: %s" % (label, e))
+
+
+async def _watchdog_tick(now, ctrl, unit_urls, fresh_s, stale, ping):
+    """One watchdog pass: ping each fresh unit's heartbeat, withhold for stale
+    ones, and log stale<->fresh transitions. `ping(label, url)` is awaited for
+    each unit that should ping. Pure of network/sleep so it's unit-testable."""
+    for key, url in unit_urls.items():
+        seen = ctrl._last_seen.get(key)
+        age = (now - seen) if seen is not None else None
+        fresh = age is not None and age < fresh_s
+        if fresh:
+            await ping(key, url)
+            if stale[key]:
+                print("CTRL: unit %s BT link recovered (age %.0fs); "
+                      "resuming heartbeat" % (key, age))
+                stale[key] = False
+        elif not stale[key]:
+            age_str = "%.0fs" % age if age is not None else "never seen"
+            print("CTRL: unit %s BT link STALE (age %s); withholding "
+                  "Better Stack heartbeat — it will page" % (key, age_str))
+            stale[key] = True
+
+
+async def heartbeat_watchdog(ctrl, unit_urls, controller_url=None,
+                             tick_s=WATCHDOG_TICK_S, fresh_s=HEARTBEAT_FRESH_S):
+    import aiohttp
+    timeout = aiohttp.ClientTimeout(total=10)
+    stale = {k: False for k in unit_urls}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async def ping(label, url):
+            await _ping(session, url, label)
+        while True:
+            now = time.time()
+            if controller_url:
+                await _ping(session, controller_url, "controller")
+            await _watchdog_tick(now, ctrl, unit_urls, fresh_s, stale, ping)
+            await asyncio.sleep(tick_s)
 
 
 # --- web portal ---------------------------------------------------------------
@@ -306,6 +388,27 @@ def make_web_app(ctrl):
             hours = 24
         return web.json_response(ctrl._metrics.history(hours=hours))
 
+    async def get_health(request):
+        """Live per-unit connection health: staleness + RSSI + drop stats.
+        Merges live state (age_s, stale, rssi) with persisted drop counts."""
+        now = time.time()
+        persisted = ctrl._metrics.health(now_ts=now) if ctrl._metrics else {}
+        units = []
+        for k, c in ctrl._conns.items():
+            seen = ctrl._last_seen.get(k)
+            age = round(now - seen, 1) if seen is not None else None
+            h = persisted.get(k, {})
+            units.append({
+                "key": k,
+                "age_s": age,
+                "stale": age is None or age >= HEARTBEAT_FRESH_S,
+                "rssi": getattr(c, "_rssi", None),
+                "drops": h.get("drops"),
+                "reconnect_fails": h.get("reconnect_fails"),
+            })
+        return web.json_response({
+            "units": units, "fresh_threshold_s": HEARTBEAT_FRESH_S, "ts": now})
+
     async def index(request):
         path = os.path.join(WEB_DIR, "index.html")
         if os.path.exists(path):
@@ -318,6 +421,7 @@ def make_web_app(ctrl):
         web.get("/api/status", get_status),
         web.get("/api/metrics", get_metrics),
         web.get("/api/history", get_history),
+        web.get("/api/health", get_health),
         web.post("/api/control", post_control),
     ])
     if os.path.isdir(WEB_DIR):
@@ -380,13 +484,33 @@ async def main(user_id, addresses, http_host="127.0.0.1", http_port=8787):
 
     db_path = _db_path()
     print("INFO: metrics db: %s" % db_path)
-    ctrl = ParallelController(metrics=Metrics(db_path))
+    bs = betterstack.from_env(os.environ)
+    print("INFO: Better Stack metrics %s" %
+          ("enabled" if bs else "disabled (no BETTERSTACK_SOURCE_URL/TOKEN)"))
+    ctrl = ParallelController(metrics=Metrics(db_path), betterstack=bs)
     await start_web(ctrl, http_host, http_port)
 
     print("INFO: connecting to: %s" % [k for k, _ in devices])
     for key, dev in devices:
         await dev.connect()
         ctrl.add(key, dev._conn)
+
+    # Better Stack heartbeat watchdog. Map the positional BETTERSTACK_HEARTBEAT_A/B
+    # env URLs onto the units in the same order as ECOFLOW_ADDR_A/B.
+    hb_env = [os.environ.get("BETTERSTACK_HEARTBEAT_A"),
+              os.environ.get("BETTERSTACK_HEARTBEAT_B")]
+    unit_urls = {key: url for (key, _), url in zip(devices, hb_env) if url}
+    controller_url = os.environ.get("BETTERSTACK_HEARTBEAT_CONTROLLER")
+    wd_task = None
+    if unit_urls or controller_url:
+        wd_task = asyncio.create_task(
+            heartbeat_watchdog(ctrl, unit_urls, controller_url))
+        print("INFO: Better Stack watchdog on: units=%s controller=%s "
+              "(tick=%ds, fresh<%ds)" % (list(unit_urls), bool(controller_url),
+                                         WATCHDOG_TICK_S, HEARTBEAT_FRESH_S))
+    else:
+        print("INFO: Better Stack watchdog disabled "
+              "(no BETTERSTACK_HEARTBEAT_* set)")
 
     # Graceful shutdown: on SIGTERM/SIGINT (systemd stop/restart) disconnect the
     # BLE links cleanly so the next start finds advertising devices.
@@ -406,6 +530,10 @@ async def main(user_id, addresses, http_host="127.0.0.1", http_port=8787):
                            return_when=asyncio.FIRST_COMPLETED)
     finally:
         print("INFO: shutting down — disconnecting BLE links cleanly")
+        if wd_task is not None:
+            wd_task.cancel()
+        if bs is not None:
+            await bs.close()
         for _, dev in devices:
             conn = getattr(dev, "_conn", None)
             if conn is not None:

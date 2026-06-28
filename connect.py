@@ -76,6 +76,11 @@ def discoveryCallback(device: BLEDevice, advertisement_data: AdvertisementData):
         dev = Device.New(device, advertisement_data)
         if dev != None:
             located_devices[device.address] = dev
+    else:
+        # Refresh signal strength on repeat advertisements (only happens while
+        # the device is NOT connected — a connected peripheral stops advertising).
+        located_devices[device.address]._rssi = getattr(
+            advertisement_data, "rssi", None)
 
 def getEcdhTypeSize(curve_num: int):
     '''Returns size of ecdh based on type'''
@@ -115,6 +120,7 @@ class Device:
         self._name = adv_data.local_name
         self._sn = None
         self._conn = None
+        self._rssi = getattr(adv_data, "rssi", None)
 
         # Looking for device SN
         man_data = adv_data.manufacturer_data[Device.MANUFACTURER_KEY]
@@ -131,6 +137,7 @@ class Device:
     async def connect(self):
         if self._conn == None:
             self._conn = Connection(self._ble_dev, self._sn)
+            self._conn._rssi = self._rssi
             await self._conn.connect()
 
     async def waitDisconnect(self):
@@ -361,6 +368,11 @@ class Connection:
         self._last_power = {}
         # Optional async callback invoked after each heartbeat: cb(connection).
         self._heartbeat_cb = None
+        # Optional sync callback for BLE lifecycle events: cb(connection, event)
+        # where event is 'connect' / 'disconnect' / 'reconnect_fail'.
+        self._event_cb = None
+        # Last-known signal strength (dBm) from advertisement at (re)scan time.
+        self._rssi = None
 
     @property
     def sn(self):
@@ -373,6 +385,24 @@ class Connection:
     def set_heartbeat_callback(self, cb):
         '''Register an async callback cb(connection) fired on each heartbeat.'''
         self._heartbeat_cb = cb
+
+    def set_event_callback(self, cb):
+        '''Register a sync callback cb(connection, event) for lifecycle events
+        ('connect' / 'disconnect' / 'reconnect_fail'). Used for drop metrics.'''
+        self._event_cb = cb
+
+    @property
+    def rssi(self):
+        return self._rssi
+
+    def _fire_event(self, event):
+        cb = self._event_cb
+        if cb is None:
+            return
+        try:
+            cb(self, event)
+        except Exception as e:
+            print("%s: WARN: event_cb(%s): %s" % (self._address, event, e))
 
     async def shutdown(self):
         self._retry_on_disconnect = False
@@ -557,9 +587,13 @@ class Connection:
         print("%s: INFO: Init completed, running init routine" % (self._address,))
 
         await self.initBleSessionKey()
+        # Session is live; record it (no-op on the very first connect, before
+        # the controller has wired its event callback).
+        self._fire_event('connect')
 
     def disconnected(self, *args, **kwargs) -> None:
         print("%s: Disconnected from device callback" % (self._address,))
+        self._fire_event('disconnect')
         # Drop the dead client so the next connect() goes through
         # establish_connection (which clears stale BlueZ state) rather than
         # reusing a half-open handle.
@@ -596,6 +630,7 @@ class Connection:
                         "%s: WARN: reconnect failed, retrying in %ds: %s"
                         % (self._address, delay, err)
                     )
+                    self._fire_event('reconnect_fail')
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
         finally:
